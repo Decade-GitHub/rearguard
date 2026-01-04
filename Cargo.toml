@@ -1,0 +1,8 @@
+[package]
+name = "rearguard"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sysinfo = "0.31"
+ctrlc = "3.4"
