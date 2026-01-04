@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 fn main() {
     let mut system = System::new();
-    let target_process = OsStr::new("VANGUARD-Win64-Shipping.exe");
+    let target_process = OsStr::new("VALORANT-Win64-Shipping.exe");
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
