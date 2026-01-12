@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 fn main() {
     let mut system = System::new();
-    let target_process = OsStr::new("VALORANT-Win64-Shipping.exe");
+    let target_names = ["VALORANT-Win64-Shipping.exe", "LeagueClient.exe", "GenshinImpact.exe"];
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -21,15 +21,18 @@ fn main() {
     while running.load(Ordering::SeqCst) {
         system.refresh_processes(ProcessesToUpdate::All);
 
-        let found = system.processes()
-            .iter()
-            .find(|(_, process)| process.name() == target_process);
-
-        if let Some((pid, _process)) = found {
-            if let Some(proc) = system.process(*pid) {
+        for target_name in &target_names {
+            let target_os_str = OsStr::new(target_name);
+            let found = system.processes()
+                .iter()
+                .find(|(_, process)| process.name() == target_os_str);
+            
+            if let Some((pid, _process)) = found {
+                if let Some(proc) = system.process(*pid) {
                 proc.kill();
-            }   
-        }
+                }   
+            }
+        }        
         thread::sleep(StdDuration::from_secs(2));
     }
 }
