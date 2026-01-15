@@ -9,30 +9,35 @@ use std::sync::Arc;
 
 fn main() {
     let mut system = System::new();
-    let target_names = ["VALORANT-Win64-Shipping.exe", "LeagueClient.exe", "GenshinImpact.exe"];
-
+    let target_processes = vec![
+        "VALORANT-Win64-Shipping.exe",
+        "vgc.exe",
+        "vgtray.exe",
+        "vgm.exe",
+        "LeagueClient.exe",
+        "GenshinImpact.exe"
+        // Add more here
+    ];
+    
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
-
+    
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-    }).expect("Error setting close handler.");
+        println!("Shutting down gracefully.")
+    }).expect("Error setting Ctrl-C handler");
 
     while running.load(Ordering::SeqCst) {
         system.refresh_processes(ProcessesToUpdate::All);
-
-        for target_name in &target_names {
-            let target_os_str = OsStr::new(target_name);
-            let found = system.processes()
-                .iter()
-                .find(|(_, process)| process.name() == target_os_str);
+        
+        for target in &target_processes {
+            let target_osstr = OsStr::new(target);
+            let mut processes = system.processes_by_exact_name(target_osstr);
             
-            if let Some((pid, _process)) = found {
-                if let Some(proc) = system.process(*pid) {
-                proc.kill();
-                }   
-            }
-        }        
+            if let Some(process) = processes.next() {
+                    process.kill();
+            } 
+        }
         thread::sleep(StdDuration::from_secs(2));
     }
 }
