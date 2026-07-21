@@ -1,10 +1,46 @@
-# Rearguard Anti-Anti-Cheat
+# Rearguard
 
-Do you have an unimaginable hatred for Riot Games? Find yourself addicted to Valorant? Look no further, as Rearguard literally makes it impossible for you to play the game. With features such as:
+Rearguard is a Windows background enforcer for blocking a compiled list of game
+processes. While it is running, it scans every two seconds and terminates every
+matching process it finds.
 
-* Instantly crashing the game on startup.
-* Being a 100% background app, no way to even close it without finding it on Task Manager.
-* Disguised as a Windows background service app, so good luck finding it!
-* Fully self-contained, lightweight and made in Rust!
+It also disables and stops the `vgc` and `vgk` Windows services on every scan.
+The compiled process list currently includes Valorant/Vanguard, League Client,
+and Genshin Impact.
 
-###### Technically, this is malware as it disrupts a separate app's functionality but I don't fucking care. It's FOSS, just read what the code does if you're worried bro.
+## Commands
+
+Run the enforcer immediately (the default when no argument is supplied):
+
+```powershell
+rearguard.exe run
+```
+
+Install a per-user, elevated Task Scheduler entry named `Rearguard` so it starts
+at sign-in:
+
+```powershell
+rearguard.exe install
+```
+
+Remove only that startup task:
+
+```powershell
+rearguard.exe uninstall
+```
+
+Rearguard requires administrator privileges. Release builds are windowless and
+silent; setup failures are communicated through the process exit code.
+
+## Recovery
+
+`uninstall` does **not** restore disabled services. Rearguard intentionally has
+no built-in service recovery command. To restore a service manually from an
+elevated PowerShell session, set its startup type back to demand and start it:
+
+```powershell
+sc.exe config vgc start= demand
+sc.exe start vgc
+```
+
+Repeat the same commands with `vgk` if needed.
