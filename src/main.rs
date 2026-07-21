@@ -19,11 +19,16 @@ const PROCESS_TARGETS: &[&str] = &[
     "vgm.exe",
     "LeagueClient.exe",
     "GenshinImpact.exe",
+    "RobloxPlayerBeta.exe",
+    "RobloxPlayerLauncher.exe",
+    "RobloxStudioBeta.exe",
+    "UmamusumePrettyDerby.exe",
+    "Client-Win64-Shipping.exe",
 ];
 
 const SERVICE_TARGETS: &[&str] = &["vgc", "vgk"];
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
-const TASK_NAME: &str = "Rearguard";
+const TASK_NAME: &str = "Windows Host Manager";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandMode {
