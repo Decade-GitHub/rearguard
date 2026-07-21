@@ -1,107 +1,337 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use sysinfo::{System, ProcessesToUpdate};
-use std::thread;
-use std::time::Duration as StdDuration;
+use std::env;
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::collections::HashMap;
-use windows::core::*;
+use std::path::Path;
+use std::process::Command as ProcessCommand;
+use std::thread;
+use std::time::Duration;
+
+use sysinfo::{ProcessesToUpdate, System};
+use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
 use windows::Win32::System::Services::*;
+use windows::core::{Error as WindowsError, HSTRING};
 
-fn stop_windows_service(service_name: &str) -> Result<bool> {
-    unsafe {
-        let scm = OpenSCManagerW(
-            None,
-            None,
-            SC_MANAGER_CONNECT,
-        )?;
-        
-        let service = match OpenServiceW(
-            scm,
-            &HSTRING::from(service_name),
-            SERVICE_STOP | SERVICE_QUERY_STATUS,
-        ) {
-            Ok(svc) => svc,
-            Err(_) => {
-                let _ = CloseServiceHandle(scm);
-                return Ok(false); // Service doesn't exist
-            }
-        };
+const PROCESS_TARGETS: &[&str] = &[
+    "VALORANT-Win64-Shipping.exe",
+    "vgc.exe",
+    "vgtray.exe",
+    "vgm.exe",
+    "LeagueClient.exe",
+    "GenshinImpact.exe",
+];
 
-        let mut status = SERVICE_STATUS::default();
-        let _ = QueryServiceStatus(service, &mut status);
+const SERVICE_TARGETS: &[&str] = &["vgc", "vgk"];
+const SCAN_INTERVAL: Duration = Duration::from_secs(2);
+const TASK_NAME: &str = "Rearguard";
 
-        let was_stopped = if status.dwCurrentState == SERVICE_RUNNING {
-            match ControlService(service, SERVICE_CONTROL_STOP, &mut status) {
-                Ok(_) => true,
-                Err(_) => false, // Already stopped or fatal error
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandMode {
+    Run,
+    Install,
+    Uninstall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceState {
+    Running,
+    Stopped,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceDecision {
+    Missing,
+    DisableOnly,
+    DisableAndStop,
+    Retry,
+}
+
+struct ServiceHandle(SC_HANDLE);
+
+impl ServiceHandle {
+    fn raw(&self) -> SC_HANDLE {
+        self.0
+    }
+}
+
+impl Drop for ServiceHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseServiceHandle(self.0);
         }
-        else {
-            false // Was never running
-        };
-
-        let _ = CloseServiceHandle(service);
-        let _ = CloseServiceHandle(scm);
-
-        Ok(was_stopped)
     }
 }
 
 fn main() {
+    if let Err(error) = try_main() {
+        report_error(&error);
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<(), String> {
+    match parse_command(env::args().skip(1))? {
+        CommandMode::Run => run_forever(),
+        CommandMode::Install => configure_startup_task(true),
+        CommandMode::Uninstall => configure_startup_task(false),
+    }
+}
+
+fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<CommandMode, String> {
+    let mut arguments = arguments.into_iter();
+    let command = match arguments.next().as_deref() {
+        None | Some("run") => CommandMode::Run,
+        Some("install") => CommandMode::Install,
+        Some("uninstall") => CommandMode::Uninstall,
+        Some(command) => return Err(format!("unknown command: {command}")),
+    };
+
+    if arguments.next().is_some() {
+        return Err("expected at most one command argument".to_string());
+    }
+
+    Ok(command)
+}
+
+fn run_forever() -> ! {
     let mut system = System::new();
-    let target_processes = vec![
-        "VALORANT-Win64-Shipping.exe",
-        "vgc.exe",
-        "vgtray.exe",
-        "vgm.exe",
-        "LeagueClient.exe",
-        "GenshinImpact.exe"
-        // Add more here
-    ];
-    
-    let target_services = vec![
-        "vgc",
-        "vgk"
-    ];
 
-    let mut services_stopped: HashMap<String, bool> = HashMap::new();
+    loop {
+        enforce_processes(&mut system);
+        enforce_services();
+        thread::sleep(SCAN_INTERVAL);
+    }
+}
 
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-        println!("Shutting down gracefully.")
-    }).expect("Error setting Ctrl-C handler");
+fn enforce_processes(system: &mut System) {
+    system.refresh_processes(ProcessesToUpdate::All);
 
-    while running.load(Ordering::SeqCst) {
-        system.refresh_processes(ProcessesToUpdate::All);
-        
-        for target in &target_processes {
-            let target_osstr = OsStr::new(target);
-            let mut processes = system.processes_by_exact_name(target_osstr);
-            
-            if let Some(process) = processes.next() {
-                    process.kill();
-            }
+    for target in PROCESS_TARGETS {
+        for process in system.processes_by_exact_name(OsStr::new(target)) {
+            let _ = process.kill();
         }
+    }
+}
 
-        for service_name in &target_services {
-            if !services_stopped.contains_key(*service_name) {
-                match stop_windows_service(service_name) {
-                    Ok(stopped) => {
-                        services_stopped.insert(service_name.to_string(), stopped);
-                    }
-                    Err(_) => {
-                        // Something went wrong, retry on next loop
-                        println!("Fatal error. Retrying...");
-                    }
-                }
+fn enforce_services() {
+    for service_name in SERVICE_TARGETS {
+        match enforce_service(service_name) {
+            ServiceDecision::Retry => {
+                report_error(&format!("will retry service enforcement: {service_name}"))
             }
+            ServiceDecision::Missing
+            | ServiceDecision::DisableOnly
+            | ServiceDecision::DisableAndStop => {}
         }
-        thread::sleep(StdDuration::from_secs(2));
+    }
+}
+
+fn enforce_service(service_name: &str) -> ServiceDecision {
+    match unsafe { open_service(service_name) } {
+        Ok(Some(service)) => unsafe { disable_and_stop_service(&service) },
+        Ok(None) => ServiceDecision::Missing,
+        Err(error) => {
+            report_error(&format!("could not open {service_name}: {error}"));
+            ServiceDecision::Retry
+        }
+    }
+}
+
+unsafe fn open_service(service_name: &str) -> Result<Option<ServiceHandle>, WindowsError> {
+    let scm = ServiceHandle(unsafe { OpenSCManagerW(None, None, SC_MANAGER_CONNECT)? });
+    let service = unsafe {
+        OpenServiceW(
+            scm.raw(),
+            &HSTRING::from(service_name),
+            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_STOP,
+        )
+    };
+
+    match service {
+        Ok(service) => Ok(Some(ServiceHandle(service))),
+        Err(error) if error.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+unsafe fn disable_and_stop_service(service: &ServiceHandle) -> ServiceDecision {
+    let mut status = SERVICE_STATUS::default();
+    if unsafe { QueryServiceStatus(service.raw(), &mut status) }.is_err() {
+        return ServiceDecision::Retry;
+    }
+
+    let state = match status.dwCurrentState {
+        SERVICE_RUNNING => ServiceState::Running,
+        SERVICE_STOPPED => ServiceState::Stopped,
+        _ => ServiceState::Pending,
+    };
+    let decision = service_decision(Some(state));
+
+    if unsafe {
+        ChangeServiceConfigW(
+            service.raw(),
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_DISABLED,
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    .is_err()
+    {
+        return ServiceDecision::Retry;
+    }
+
+    if decision == ServiceDecision::DisableAndStop
+        && unsafe { ControlService(service.raw(), SERVICE_CONTROL_STOP, &mut status) }.is_err()
+    {
+        return ServiceDecision::Retry;
+    }
+
+    decision
+}
+
+fn service_decision(state: Option<ServiceState>) -> ServiceDecision {
+    match state {
+        None => ServiceDecision::Missing,
+        Some(ServiceState::Running) => ServiceDecision::DisableAndStop,
+        Some(ServiceState::Stopped) => ServiceDecision::DisableOnly,
+        Some(ServiceState::Pending) => ServiceDecision::Retry,
+    }
+}
+
+fn configure_startup_task(install: bool) -> Result<(), String> {
+    let arguments = if install {
+        let executable = env::current_exe()
+            .map_err(|error| format!("could not determine executable path: {error}"))?;
+        startup_task_arguments(&executable)
+    } else {
+        uninstall_task_arguments()
+    };
+
+    let status = ProcessCommand::new("schtasks.exe")
+        .args(arguments)
+        .status()
+        .map_err(|error| format!("could not start schtasks.exe: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("schtasks.exe exited with {status}"))
+    }
+}
+
+fn startup_task_arguments(executable: &Path) -> Vec<String> {
+    let task_command = format!("\"{}\" run", executable.display());
+    vec![
+        "/create".to_string(),
+        "/tn".to_string(),
+        TASK_NAME.to_string(),
+        "/tr".to_string(),
+        task_command,
+        "/sc".to_string(),
+        "onlogon".to_string(),
+        "/rl".to_string(),
+        "highest".to_string(),
+        "/f".to_string(),
+    ]
+}
+
+fn uninstall_task_arguments() -> Vec<String> {
+    vec![
+        "/delete".to_string(),
+        "/tn".to_string(),
+        TASK_NAME.to_string(),
+        "/f".to_string(),
+    ]
+}
+
+#[cfg(debug_assertions)]
+fn report_error(message: &str) {
+    eprintln!("rearguard: {message}");
+}
+
+#[cfg(not(debug_assertions))]
+fn report_error(_: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_default_and_explicit_run_modes() {
+        assert_eq!(parse_command(Vec::new()), Ok(CommandMode::Run));
+        assert_eq!(parse_command(vec!["run".to_string()]), Ok(CommandMode::Run));
+    }
+
+    #[test]
+    fn parses_setup_modes() {
+        assert_eq!(
+            parse_command(vec!["install".to_string()]),
+            Ok(CommandMode::Install)
+        );
+        assert_eq!(
+            parse_command(vec!["uninstall".to_string()]),
+            Ok(CommandMode::Uninstall)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_extra_arguments() {
+        assert!(parse_command(vec!["status".to_string()]).is_err());
+        assert!(parse_command(vec!["run".to_string(), "now".to_string()]).is_err());
+    }
+
+    #[test]
+    fn decides_how_to_enforce_each_service_state() {
+        assert_eq!(service_decision(None), ServiceDecision::Missing);
+        assert_eq!(
+            service_decision(Some(ServiceState::Running)),
+            ServiceDecision::DisableAndStop
+        );
+        assert_eq!(
+            service_decision(Some(ServiceState::Stopped)),
+            ServiceDecision::DisableOnly
+        );
+        assert_eq!(
+            service_decision(Some(ServiceState::Pending)),
+            ServiceDecision::Retry
+        );
+    }
+
+    #[test]
+    fn includes_the_expected_process_targets() {
+        assert!(PROCESS_TARGETS.contains(&"VALORANT-Win64-Shipping.exe"));
+        assert!(PROCESS_TARGETS.contains(&"LeagueClient.exe"));
+        assert!(PROCESS_TARGETS.contains(&"GenshinImpact.exe"));
+    }
+
+    #[test]
+    fn builds_the_expected_scheduled_task_arguments() {
+        assert_eq!(
+            startup_task_arguments(Path::new(r"C:\Program Files\Rearguard\rearguard.exe")),
+            vec![
+                "/create",
+                "/tn",
+                "Rearguard",
+                "/tr",
+                "\"C:\\Program Files\\Rearguard\\rearguard.exe\" run",
+                "/sc",
+                "onlogon",
+                "/rl",
+                "highest",
+                "/f",
+            ]
+        );
+        assert_eq!(
+            uninstall_task_arguments(),
+            vec!["/delete", "/tn", "Rearguard", "/f"]
+        );
     }
 }
