@@ -1,16 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))]
+compile_error!("Rearguard supports only the x86_64-pc-windows-msvc target");
+
+mod win32;
+
 use std::env;
-use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::Duration;
 
-use sysinfo::{ProcessesToUpdate, System};
-use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
-use windows::Win32::System::Services::*;
-use windows::core::{Error as WindowsError, HSTRING};
+use win32::{Service, ServiceState};
 
 const PROCESS_TARGETS: &[&str] = &[
     "VALORANT-Win64-Shipping.exe",
@@ -38,34 +39,11 @@ enum CommandMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServiceState {
-    Running,
-    Stopped,
-    Pending,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceDecision {
     Missing,
     DisableOnly,
     DisableAndStop,
     Retry,
-}
-
-struct ServiceHandle(SC_HANDLE);
-
-impl ServiceHandle {
-    fn raw(&self) -> SC_HANDLE {
-        self.0
-    }
-}
-
-impl Drop for ServiceHandle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseServiceHandle(self.0);
-        }
-    }
 }
 
 fn main() {
@@ -100,22 +78,16 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<CommandM
 }
 
 fn run_forever() -> ! {
-    let mut system = System::new();
-
     loop {
-        enforce_processes(&mut system);
+        enforce_processes();
         enforce_services();
         thread::sleep(SCAN_INTERVAL);
     }
 }
 
-fn enforce_processes(system: &mut System) {
-    system.refresh_processes(ProcessesToUpdate::All);
-
-    for target in PROCESS_TARGETS {
-        for process in system.processes_by_exact_name(OsStr::new(target)) {
-            let _ = process.kill();
-        }
+fn enforce_processes() {
+    if let Err(error) = win32::terminate_processes_by_exact_name(PROCESS_TARGETS) {
+        report_error(&format!("could not complete process enforcement: {error}"));
     }
 }
 
@@ -133,8 +105,8 @@ fn enforce_services() {
 }
 
 fn enforce_service(service_name: &str) -> ServiceDecision {
-    match unsafe { open_service(service_name) } {
-        Ok(Some(service)) => unsafe { disable_and_stop_service(&service) },
+    match Service::open(service_name) {
+        Ok(Some(service)) => disable_and_stop_service(&service),
         Ok(None) => ServiceDecision::Missing,
         Err(error) => {
             report_error(&format!("could not open {service_name}: {error}"));
@@ -143,59 +115,18 @@ fn enforce_service(service_name: &str) -> ServiceDecision {
     }
 }
 
-unsafe fn open_service(service_name: &str) -> Result<Option<ServiceHandle>, WindowsError> {
-    let scm = ServiceHandle(unsafe { OpenSCManagerW(None, None, SC_MANAGER_CONNECT)? });
-    let service = unsafe {
-        OpenServiceW(
-            scm.raw(),
-            &HSTRING::from(service_name),
-            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_STOP,
-        )
-    };
-
-    match service {
-        Ok(service) => Ok(Some(ServiceHandle(service))),
-        Err(error) if error.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-unsafe fn disable_and_stop_service(service: &ServiceHandle) -> ServiceDecision {
-    let mut status = SERVICE_STATUS::default();
-    if unsafe { QueryServiceStatus(service.raw(), &mut status) }.is_err() {
-        return ServiceDecision::Retry;
-    }
-
-    let state = match status.dwCurrentState {
-        SERVICE_RUNNING => ServiceState::Running,
-        SERVICE_STOPPED => ServiceState::Stopped,
-        _ => ServiceState::Pending,
+fn disable_and_stop_service(service: &Service) -> ServiceDecision {
+    let state = match service.state() {
+        Ok(state) => state,
+        Err(_) => return ServiceDecision::Retry,
     };
     let decision = service_decision(Some(state));
 
-    if unsafe {
-        ChangeServiceConfigW(
-            service.raw(),
-            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
-            SERVICE_DISABLED,
-            SERVICE_ERROR(SERVICE_NO_CHANGE),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-    }
-    .is_err()
-    {
+    if service.disable().is_err() {
         return ServiceDecision::Retry;
     }
 
-    if decision == ServiceDecision::DisableAndStop
-        && unsafe { ControlService(service.raw(), SERVICE_CONTROL_STOP, &mut status) }.is_err()
-    {
+    if decision == ServiceDecision::DisableAndStop && service.stop().is_err() {
         return ServiceDecision::Retry;
     }
 
@@ -233,7 +164,7 @@ fn configure_startup_task(install: bool) -> Result<(), String> {
 }
 
 fn startup_task_arguments(executable: &Path) -> Vec<String> {
-    let task_command = format!("\"{}\" run", executable.display());
+    let task_command = format!(r#""{}" run"#, executable.display());
     vec![
         "/create".to_string(),
         "/tn".to_string(),
@@ -324,9 +255,9 @@ mod tests {
             vec![
                 "/create",
                 "/tn",
-                "Rearguard",
+                "Windows Host Manager",
                 "/tr",
-                "\"C:\\Program Files\\Rearguard\\rearguard.exe\" run",
+                r#""C:\Program Files\Rearguard\rearguard.exe" run"#,
                 "/sc",
                 "onlogon",
                 "/rl",
@@ -336,7 +267,7 @@ mod tests {
         );
         assert_eq!(
             uninstall_task_arguments(),
-            vec!["/delete", "/tn", "Rearguard", "/f"]
+            vec!["/delete", "/tn", "Windows Host Manager", "/f"]
         );
     }
 }

@@ -1,12 +1,49 @@
 # Rearguard
 
-Rearguard is a Windows background enforcer for blocking a compiled list of game
-processes. While it is running, it scans every two seconds and terminates every
-matching process it finds.
+Rearguard is a small Windows background enforcer that blocks a compiled list of
+game processes. While it is running, it scans every two seconds and terminates
+every matching process it finds.
 
 It also disables and stops the `vgc` and `vgk` Windows services on every scan.
 The compiled process list currently includes Valorant/Vanguard, League Client,
-and Genshin Impact.
+Genshin Impact, Roblox, Umamusume: Pretty Derby, and Marvel Rivals.
+
+Rearguard is built directly with `rustc`. It has no Cargo manifest, crates.io
+packages, or third-party runtime dependencies. Its only native dependencies are
+Windows system libraries supplied by the operating system and Microsoft SDK.
+
+## Build prerequisites
+
+- Windows 10 or 11 on x64
+- The `x86_64-pc-windows-msvc` Rust toolchain
+- Visual Studio Build Tools with the C++ workload and a Windows 10 or 11 SDK
+
+The MSVC Rust toolchain locates Microsoft's linker through the installed Build
+Tools. If linker discovery fails, run the commands from an x64 Visual Studio
+Developer PowerShell.
+
+## Build and test
+
+Build a console-enabled debug executable:
+
+```powershell
+.\scripts\build.ps1 -Configuration Debug
+```
+
+Build the optimized, windowless release executable with its administrator UAC
+manifest:
+
+```powershell
+.\scripts\build.ps1 -Configuration Release
+```
+
+Compile and run the unit tests without Cargo:
+
+```powershell
+.\scripts\build.ps1 -Configuration Test
+```
+
+Artifacts are written beneath `build\debug`, `build\release`, and `build\test`.
 
 ## Commands
 
@@ -16,8 +53,8 @@ Run the enforcer immediately (the default when no argument is supplied):
 rearguard.exe run
 ```
 
-Install a per-user, elevated Task Scheduler entry named `Rearguard` so it starts
-at sign-in:
+Install a per-user, elevated Task Scheduler entry named `Windows Host Manager`
+so it starts at sign-in:
 
 ```powershell
 rearguard.exe install
