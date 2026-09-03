@@ -30,6 +30,8 @@ const PROCESS_TARGETS: &[&str] = &[
 const SERVICE_TARGETS: &[&str] = &["vgc", "vgk"];
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const TASK_NAME: &str = "Windows Host Manager";
+const BLOCK_DIALOG_TITLE: &str = "VAN: STATUS_SB_POLICY";
+const BLOCK_DIALOG_MESSAGE: &str = "The secure boot policy of this device could not be verified. Please ensure the secure boot database is set to factory default settings.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandMode {
@@ -79,29 +81,38 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<CommandM
 
 fn run_forever() -> ! {
     loop {
-        enforce_processes();
-        enforce_services();
+        let process_blocked = enforce_processes();
+        let service_blocked = enforce_services();
+        if scan_was_blocked(process_blocked, service_blocked) {
+            if let Err(error) =
+                win32::show_error_message_box(BLOCK_DIALOG_MESSAGE, BLOCK_DIALOG_TITLE)
+            {
+                report_error(&format!("could not show blocking alert: {error}"));
+            }
+        }
         thread::sleep(SCAN_INTERVAL);
     }
 }
 
-fn enforce_processes() {
-    if let Err(error) = win32::terminate_processes_by_exact_name(PROCESS_TARGETS) {
+fn enforce_processes() -> bool {
+    let result = win32::terminate_processes_by_exact_name(PROCESS_TARGETS);
+    if let Some(error) = result.first_error {
         report_error(&format!("could not complete process enforcement: {error}"));
     }
+    result.terminated_any
 }
 
-fn enforce_services() {
+fn enforce_services() -> bool {
+    let mut blocked_any = false;
     for service_name in SERVICE_TARGETS {
         match enforce_service(service_name) {
             ServiceDecision::Retry => {
                 report_error(&format!("will retry service enforcement: {service_name}"))
             }
-            ServiceDecision::Missing
-            | ServiceDecision::DisableOnly
-            | ServiceDecision::DisableAndStop => {}
+            decision => blocked_any |= service_decision_blocks(decision),
         }
     }
+    blocked_any
 }
 
 fn enforce_service(service_name: &str) -> ServiceDecision {
@@ -140,6 +151,14 @@ fn service_decision(state: Option<ServiceState>) -> ServiceDecision {
         Some(ServiceState::Stopped) => ServiceDecision::DisableOnly,
         Some(ServiceState::Pending) => ServiceDecision::Retry,
     }
+}
+
+fn service_decision_blocks(decision: ServiceDecision) -> bool {
+    decision == ServiceDecision::DisableAndStop
+}
+
+fn scan_was_blocked(process_blocked: bool, service_blocked: bool) -> bool {
+    process_blocked || service_blocked
 }
 
 fn configure_startup_task(install: bool) -> Result<(), String> {
@@ -239,6 +258,28 @@ mod tests {
             service_decision(Some(ServiceState::Pending)),
             ServiceDecision::Retry
         );
+    }
+
+    #[test]
+    fn only_successfully_stopping_a_running_service_triggers_an_alert() {
+        assert!(!service_decision_blocks(ServiceDecision::Missing));
+        assert!(!service_decision_blocks(ServiceDecision::DisableOnly));
+        assert!(service_decision_blocks(ServiceDecision::DisableAndStop));
+        assert!(!service_decision_blocks(ServiceDecision::Retry));
+    }
+
+    #[test]
+    fn a_scan_triggers_one_alert_if_processes_or_services_were_blocked() {
+        assert!(!scan_was_blocked(false, false));
+        assert!(scan_was_blocked(true, false));
+        assert!(scan_was_blocked(false, true));
+        assert!(scan_was_blocked(true, true));
+    }
+
+    #[test]
+    fn uses_the_expected_blocking_alert_copy() {
+        assert_eq!(BLOCK_DIALOG_TITLE, "Windows Error");
+        assert_eq!(BLOCK_DIALOG_MESSAGE, "No, bro. Play better games");
     }
 
     #[test]

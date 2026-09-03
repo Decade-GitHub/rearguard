@@ -33,6 +33,9 @@ const SERVICE_RUNNING: Dword = 0x0000_0004;
 const SERVICE_DISABLED: Dword = 0x0000_0004;
 const SERVICE_NO_CHANGE: Dword = 0xffff_ffff;
 
+const MB_OK: Dword = 0x0000_0000;
+const MB_ICONERROR: Dword = 0x0000_0010;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ProcessEntry32W {
@@ -115,6 +118,16 @@ unsafe extern "system" {
     ) -> Bool;
     fn ControlService(service: ScHandle, control: Dword, status: *mut ServiceStatus) -> Bool;
     fn CloseServiceHandle(service: ScHandle) -> Bool;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn MessageBoxW(
+        window: Handle,
+        text: *const u16,
+        caption: *const u16,
+        message_type: Dword,
+    ) -> i32;
 }
 
 struct KernelHandle(Handle);
@@ -251,41 +264,83 @@ impl Service {
     }
 }
 
-pub(crate) fn terminate_processes_by_exact_name(targets: &[&str]) -> io::Result<()> {
-    let snapshot =
-        KernelHandle::from_snapshot(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
+#[derive(Default)]
+pub(crate) struct ProcessEnforcementResult {
+    pub(crate) terminated_any: bool,
+    pub(crate) first_error: Option<io::Error>,
+}
+
+impl ProcessEnforcementResult {
+    fn record_termination(&mut self) {
+        self.terminated_any = true;
+    }
+
+    fn record_error(&mut self, error: io::Error) {
+        self.first_error.get_or_insert(error);
+    }
+}
+
+pub(crate) fn terminate_processes_by_exact_name(targets: &[&str]) -> ProcessEnforcementResult {
+    let mut result = ProcessEnforcementResult::default();
+    let snapshot = match KernelHandle::from_snapshot(unsafe {
+        CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    }) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            result.record_error(error);
+            return result;
+        }
+    };
     let mut entry = ProcessEntry32W::default();
 
     if unsafe { Process32FirstW(snapshot.raw(), &mut entry) } == FALSE {
         let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
-            Ok(())
-        } else {
-            Err(error)
-        };
+        if error.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
+            result.record_error(error);
+        }
+        return result;
     }
 
-    let mut first_error = None;
     loop {
         if targets
             .iter()
             .any(|target| executable_name_matches(&entry.executable_file, target))
         {
-            if let Err(error) = terminate_process(entry.process_id) {
-                first_error.get_or_insert(error);
+            match terminate_process(entry.process_id) {
+                Ok(()) => result.record_termination(),
+                Err(error) => result.record_error(error),
             }
         }
 
         if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == FALSE {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
-                return Err(error);
+                result.record_error(error);
             }
             break;
         }
     }
 
-    first_error.map_or(Ok(()), Err)
+    result
+}
+
+pub(crate) fn show_error_message_box(message: &str, caption: &str) -> io::Result<()> {
+    let message = to_wide_null(message)?;
+    let caption = to_wide_null(caption)?;
+    let result = unsafe {
+        MessageBoxW(
+            null_mut(),
+            message.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn terminate_process(process_id: Dword) -> io::Result<()> {
@@ -341,7 +396,18 @@ mod tests {
 
     #[test]
     fn enumerates_processes_without_terminating_anything() {
-        terminate_processes_by_exact_name(&[]).unwrap();
+        let result = terminate_processes_by_exact_name(&[]);
+        assert!(!result.terminated_any);
+        assert!(result.first_error.is_none());
+    }
+
+    #[test]
+    fn tracks_successful_process_terminations_separately_from_errors() {
+        let mut result = ProcessEnforcementResult::default();
+        result.record_termination();
+        result.record_error(io::Error::other("test error"));
+        assert!(result.terminated_any);
+        assert!(result.first_error.is_some());
     }
 
     #[test]
@@ -355,6 +421,11 @@ mod tests {
         assert_eq!(to_wide_null("vgc").unwrap(), vec![118, 103, 99, 0]);
         assert_eq!(to_wide_null("A💣").unwrap(), vec![65, 0xd83d, 0xdca3, 0]);
         assert!(to_wide_null("bad\0name").is_err());
+    }
+
+    #[test]
+    fn rejects_message_box_strings_with_interior_nulls_before_calling_win32() {
+        assert!(show_error_message_box("bad\0message", "Windows Error").is_err());
     }
 
     #[test]
@@ -376,5 +447,6 @@ mod tests {
             0x0026
         );
         assert_eq!(SERVICE_DISABLED, 0x0000_0004);
+        assert_eq!(MB_OK | MB_ICONERROR, 0x0000_0010);
     }
 }
