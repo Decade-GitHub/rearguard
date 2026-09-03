@@ -1,16 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))]
+compile_error!("Rearguard supports only the x86_64-pc-windows-msvc target");
+
+mod win32;
+
 use std::env;
-use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::Duration;
 
-use sysinfo::{ProcessesToUpdate, System};
-use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
-use windows::Win32::System::Services::*;
-use windows::core::{Error as WindowsError, HSTRING};
+use win32::{Service, ServiceState};
 
 const PROCESS_TARGETS: &[&str] = &[
     "VALORANT-Win64-Shipping.exe",
@@ -29,6 +30,8 @@ const PROCESS_TARGETS: &[&str] = &[
 const SERVICE_TARGETS: &[&str] = &["vgc", "vgk"];
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const TASK_NAME: &str = "Windows Host Manager";
+const BLOCK_DIALOG_TITLE: &str = "VAN: STATUS_SB_POLICY";
+const BLOCK_DIALOG_MESSAGE: &str = "The secure boot policy of this device could not be verified. Please ensure the secure boot database is set to factory default settings.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandMode {
@@ -38,34 +41,11 @@ enum CommandMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServiceState {
-    Running,
-    Stopped,
-    Pending,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceDecision {
     Missing,
     DisableOnly,
     DisableAndStop,
     Retry,
-}
-
-struct ServiceHandle(SC_HANDLE);
-
-impl ServiceHandle {
-    fn raw(&self) -> SC_HANDLE {
-        self.0
-    }
-}
-
-impl Drop for ServiceHandle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CloseServiceHandle(self.0);
-        }
-    }
 }
 
 fn main() {
@@ -100,41 +80,44 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<CommandM
 }
 
 fn run_forever() -> ! {
-    let mut system = System::new();
-
     loop {
-        enforce_processes(&mut system);
-        enforce_services();
+        let process_blocked = enforce_processes();
+        let service_blocked = enforce_services();
+        if scan_was_blocked(process_blocked, service_blocked) {
+            if let Err(error) =
+                win32::show_error_message_box(BLOCK_DIALOG_MESSAGE, BLOCK_DIALOG_TITLE)
+            {
+                report_error(&format!("could not show blocking alert: {error}"));
+            }
+        }
         thread::sleep(SCAN_INTERVAL);
     }
 }
 
-fn enforce_processes(system: &mut System) {
-    system.refresh_processes(ProcessesToUpdate::All);
-
-    for target in PROCESS_TARGETS {
-        for process in system.processes_by_exact_name(OsStr::new(target)) {
-            let _ = process.kill();
-        }
+fn enforce_processes() -> bool {
+    let result = win32::terminate_processes_by_exact_name(PROCESS_TARGETS);
+    if let Some(error) = result.first_error {
+        report_error(&format!("could not complete process enforcement: {error}"));
     }
+    result.terminated_any
 }
 
-fn enforce_services() {
+fn enforce_services() -> bool {
+    let mut blocked_any = false;
     for service_name in SERVICE_TARGETS {
         match enforce_service(service_name) {
             ServiceDecision::Retry => {
                 report_error(&format!("will retry service enforcement: {service_name}"))
             }
-            ServiceDecision::Missing
-            | ServiceDecision::DisableOnly
-            | ServiceDecision::DisableAndStop => {}
+            decision => blocked_any |= service_decision_blocks(decision),
         }
     }
+    blocked_any
 }
 
 fn enforce_service(service_name: &str) -> ServiceDecision {
-    match unsafe { open_service(service_name) } {
-        Ok(Some(service)) => unsafe { disable_and_stop_service(&service) },
+    match Service::open(service_name) {
+        Ok(Some(service)) => disable_and_stop_service(&service),
         Ok(None) => ServiceDecision::Missing,
         Err(error) => {
             report_error(&format!("could not open {service_name}: {error}"));
@@ -143,59 +126,18 @@ fn enforce_service(service_name: &str) -> ServiceDecision {
     }
 }
 
-unsafe fn open_service(service_name: &str) -> Result<Option<ServiceHandle>, WindowsError> {
-    let scm = ServiceHandle(unsafe { OpenSCManagerW(None, None, SC_MANAGER_CONNECT)? });
-    let service = unsafe {
-        OpenServiceW(
-            scm.raw(),
-            &HSTRING::from(service_name),
-            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_STOP,
-        )
-    };
-
-    match service {
-        Ok(service) => Ok(Some(ServiceHandle(service))),
-        Err(error) if error.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-unsafe fn disable_and_stop_service(service: &ServiceHandle) -> ServiceDecision {
-    let mut status = SERVICE_STATUS::default();
-    if unsafe { QueryServiceStatus(service.raw(), &mut status) }.is_err() {
-        return ServiceDecision::Retry;
-    }
-
-    let state = match status.dwCurrentState {
-        SERVICE_RUNNING => ServiceState::Running,
-        SERVICE_STOPPED => ServiceState::Stopped,
-        _ => ServiceState::Pending,
+fn disable_and_stop_service(service: &Service) -> ServiceDecision {
+    let state = match service.state() {
+        Ok(state) => state,
+        Err(_) => return ServiceDecision::Retry,
     };
     let decision = service_decision(Some(state));
 
-    if unsafe {
-        ChangeServiceConfigW(
-            service.raw(),
-            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
-            SERVICE_DISABLED,
-            SERVICE_ERROR(SERVICE_NO_CHANGE),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-    }
-    .is_err()
-    {
+    if service.disable().is_err() {
         return ServiceDecision::Retry;
     }
 
-    if decision == ServiceDecision::DisableAndStop
-        && unsafe { ControlService(service.raw(), SERVICE_CONTROL_STOP, &mut status) }.is_err()
-    {
+    if decision == ServiceDecision::DisableAndStop && service.stop().is_err() {
         return ServiceDecision::Retry;
     }
 
@@ -209,6 +151,14 @@ fn service_decision(state: Option<ServiceState>) -> ServiceDecision {
         Some(ServiceState::Stopped) => ServiceDecision::DisableOnly,
         Some(ServiceState::Pending) => ServiceDecision::Retry,
     }
+}
+
+fn service_decision_blocks(decision: ServiceDecision) -> bool {
+    decision == ServiceDecision::DisableAndStop
+}
+
+fn scan_was_blocked(process_blocked: bool, service_blocked: bool) -> bool {
+    process_blocked || service_blocked
 }
 
 fn configure_startup_task(install: bool) -> Result<(), String> {
@@ -233,7 +183,7 @@ fn configure_startup_task(install: bool) -> Result<(), String> {
 }
 
 fn startup_task_arguments(executable: &Path) -> Vec<String> {
-    let task_command = format!("\"{}\" run", executable.display());
+    let task_command = format!(r#""{}" run"#, executable.display());
     vec![
         "/create".to_string(),
         "/tn".to_string(),
@@ -311,6 +261,28 @@ mod tests {
     }
 
     #[test]
+    fn only_successfully_stopping_a_running_service_triggers_an_alert() {
+        assert!(!service_decision_blocks(ServiceDecision::Missing));
+        assert!(!service_decision_blocks(ServiceDecision::DisableOnly));
+        assert!(service_decision_blocks(ServiceDecision::DisableAndStop));
+        assert!(!service_decision_blocks(ServiceDecision::Retry));
+    }
+
+    #[test]
+    fn a_scan_triggers_one_alert_if_processes_or_services_were_blocked() {
+        assert!(!scan_was_blocked(false, false));
+        assert!(scan_was_blocked(true, false));
+        assert!(scan_was_blocked(false, true));
+        assert!(scan_was_blocked(true, true));
+    }
+
+    #[test]
+    fn uses_the_expected_blocking_alert_copy() {
+        assert_eq!(BLOCK_DIALOG_TITLE, "Windows Error");
+        assert_eq!(BLOCK_DIALOG_MESSAGE, "No, bro. Play better games");
+    }
+
+    #[test]
     fn includes_the_expected_process_targets() {
         assert!(PROCESS_TARGETS.contains(&"VALORANT-Win64-Shipping.exe"));
         assert!(PROCESS_TARGETS.contains(&"LeagueClient.exe"));
@@ -324,9 +296,9 @@ mod tests {
             vec![
                 "/create",
                 "/tn",
-                "Rearguard",
+                "Windows Host Manager",
                 "/tr",
-                "\"C:\\Program Files\\Rearguard\\rearguard.exe\" run",
+                r#""C:\Program Files\Rearguard\rearguard.exe" run"#,
                 "/sc",
                 "onlogon",
                 "/rl",
@@ -336,7 +308,7 @@ mod tests {
         );
         assert_eq!(
             uninstall_task_arguments(),
-            vec!["/delete", "/tn", "Rearguard", "/f"]
+            vec!["/delete", "/tn", "Windows Host Manager", "/f"]
         );
     }
 }
