@@ -30,10 +30,10 @@ const PROCESS_TARGETS: &[&str] = &[
 const SERVICE_TARGETS: &[&str] = &["vgc", "vgk"];
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const TASK_NAME: &str = "Windows Host Manager";
-const BLOCK_DIALOG_TITLE: &str = "ERROR";
-const BETTER_GAMES_MESSAGE: &str = "VAN: RESTRICTION: 1 - UEFI Secure Boot verification failure";
-const STOP_SPENDING_MESSAGE: &str = "FATAL ERROR! D3D11 access violation.";
-const ORIGINAL_GAMES_MESSAGE: &str = "Unable to start Hyperion engine.";
+const BLOCK_DIALOG_TITLE: &str = "No.";
+const BETTER_GAMES_MESSAGE: &str = "Play better games.";
+const STOP_SPENDING_MESSAGE: &str = "Stop spending money you don't have.";
+const ORIGINAL_GAMES_MESSAGE: &str = "Play origianal games.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandMode {
