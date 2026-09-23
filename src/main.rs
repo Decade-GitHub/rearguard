@@ -1,146 +1,95 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![no_std]
+#![no_main]
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc")))]
 compile_error!("Rearguard supports only the x86_64-pc-windows-msvc target");
 
+mod logic;
+mod runtime;
+mod task;
 mod win32;
 
-use std::env;
-use std::path::Path;
-use std::process::Command as ProcessCommand;
-use std::thread;
-use std::time::Duration;
+use core::panic::PanicInfo;
+use logic::{
+    AlertKind, BLOCK_DIALOG_TITLE, CommandMode, PROCESS_TARGETS, SERVICE_TARGETS, ServiceDecision,
+    ServiceState, alert_for_scan, service_decision,
+};
+use win32::Service;
 
-use win32::{Service, ServiceState};
-
-const PROCESS_TARGETS: &[&str] = &[
-    "VALORANT-Win64-Shipping.exe",
-    "vgc.exe",
-    "vgtray.exe",
-    "vgm.exe",
-    "LeagueClient.exe",
-    "GenshinImpact.exe",
-    "RobloxPlayerBeta.exe",
-    "RobloxPlayerLauncher.exe",
-    "RobloxStudioBeta.exe",
-    "UmamusumePrettyDerby.exe",
-    "Client-Win64-Shipping.exe",
-];
-
-const SERVICE_TARGETS: &[&str] = &["vgc", "vgk"];
-const SCAN_INTERVAL: Duration = Duration::from_secs(2);
-const TASK_NAME: &str = "Windows Host Manager";
-const BLOCK_DIALOG_TITLE: &str = "No.";
-const BETTER_GAMES_MESSAGE: &str = "Play better games.";
-const STOP_SPENDING_MESSAGE: &str = "Stop spending money you don't have.";
-const ORIGINAL_GAMES_MESSAGE: &str = "Play origianal games.";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandMode {
-    Run,
-    Install,
-    Uninstall,
+#[panic_handler]
+fn panic(_: &PanicInfo<'_>) -> ! {
+    win32::exit(101)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServiceDecision {
-    Missing,
-    DisableOnly,
-    DisableAndStop,
-    Retry,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum AlertKind {
-    BetterGames,
-    StopSpending,
-    OriginalGames,
-}
-
-impl AlertKind {
-    fn message(self) -> &'static str {
-        match self {
-            Self::BetterGames => BETTER_GAMES_MESSAGE,
-            Self::StopSpending => STOP_SPENDING_MESSAGE,
-            Self::OriginalGames => ORIGINAL_GAMES_MESSAGE,
+#[unsafe(no_mangle)]
+pub extern "system" fn rearguard_entry() -> ! {
+    let command_line = match win32::command_line() {
+        Ok(command_line) => command_line,
+        Err(error) => {
+            win32::report_error(error);
+            win32::exit(1);
         }
-    }
-}
-
-fn main() {
-    if let Err(error) = try_main() {
-        report_error(&error);
-        std::process::exit(1);
-    }
-}
-
-fn try_main() -> Result<(), String> {
-    match parse_command(env::args().skip(1))? {
-        CommandMode::Run => run_forever(),
-        CommandMode::Install => configure_startup_task(true),
-        CommandMode::Uninstall => configure_startup_task(false),
-    }
-}
-
-fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<CommandMode, String> {
-    let mut arguments = arguments.into_iter();
-    let command = match arguments.next().as_deref() {
-        None | Some("run") => CommandMode::Run,
-        Some("install") => CommandMode::Install,
-        Some("uninstall") => CommandMode::Uninstall,
-        Some(command) => return Err(format!("unknown command: {command}")),
+    };
+    let command = match logic::parse_command_line(command_line) {
+        Ok(command) => command,
+        Err(_) => {
+            win32::report_message("invalid command line");
+            win32::exit(1);
+        }
     };
 
-    if arguments.next().is_some() {
-        return Err("expected at most one command argument".to_string());
+    match command {
+        CommandMode::Run => run_forever(),
+        CommandMode::Install | CommandMode::Uninstall => {
+            if let Err(error) = task::configure_startup_task(command == CommandMode::Install) {
+                win32::report_error(error);
+                win32::exit(1);
+            }
+            win32::exit(0)
+        }
     }
-
-    Ok(command)
 }
 
 fn run_forever() -> ! {
     loop {
-        let process_blocked = enforce_processes();
+        let process_alert = enforce_processes();
         let service_blocked = enforce_services();
-        if let Some(alert) = alert_for_scan(&process_blocked, service_blocked) {
-            if let Err(error) = win32::show_error_message_box(alert.message(), BLOCK_DIALOG_TITLE) {
-                report_error(&format!("could not show blocking alert: {error}"));
+        if let Some(alert) = alert_for_scan(process_alert, service_blocked) {
+            if let Err(error) =
+                win32::show_error_message_box(alert.message(), BLOCK_DIALOG_TITLE)
+            {
+                win32::report_error(error);
             }
         }
-        thread::sleep(SCAN_INTERVAL);
+        win32::sleep(2_000);
     }
 }
 
-fn enforce_processes() -> Vec<&'static str> {
+fn enforce_processes() -> Option<AlertKind> {
     let result = win32::terminate_processes_by_exact_name(PROCESS_TARGETS);
     if let Some(error) = result.first_error {
-        report_error(&format!("could not complete process enforcement: {error}"));
+        win32::report_error(error);
     }
-    result.terminated_targets
+    result.alert
 }
 
 fn enforce_services() -> bool {
     let mut blocked_any = false;
-    for service_name in SERVICE_TARGETS {
-        match enforce_service(service_name) {
-            ServiceDecision::Retry => {
-                report_error(&format!("will retry service enforcement: {service_name}"))
+    for &name in SERVICE_TARGETS {
+        let decision = match Service::open(name) {
+            Ok(Some(service)) => disable_and_stop_service(&service),
+            Ok(None) => ServiceDecision::Missing,
+            Err(error) => {
+                win32::report_error(error);
+                ServiceDecision::Retry
             }
-            decision => blocked_any |= service_decision_blocks(decision),
+        };
+        if decision == ServiceDecision::Retry {
+            win32::report_message("will retry service enforcement");
         }
+        blocked_any |= decision == ServiceDecision::DisableAndStop;
     }
     blocked_any
-}
-
-fn enforce_service(service_name: &str) -> ServiceDecision {
-    match Service::open(service_name) {
-        Ok(Some(service)) => disable_and_stop_service(&service),
-        Ok(None) => ServiceDecision::Missing,
-        Err(error) => {
-            report_error(&format!("could not open {service_name}: {error}"));
-            ServiceDecision::Retry
-        }
-    }
 }
 
 fn disable_and_stop_service(service: &Service) -> ServiceDecision {
@@ -149,245 +98,11 @@ fn disable_and_stop_service(service: &Service) -> ServiceDecision {
         Err(_) => return ServiceDecision::Retry,
     };
     let decision = service_decision(Some(state));
-
     if service.disable().is_err() {
         return ServiceDecision::Retry;
     }
-
-    if decision == ServiceDecision::DisableAndStop && service.stop().is_err() {
+    if state == ServiceState::Running && service.stop().is_err() {
         return ServiceDecision::Retry;
     }
-
     decision
-}
-
-fn service_decision(state: Option<ServiceState>) -> ServiceDecision {
-    match state {
-        None => ServiceDecision::Missing,
-        Some(ServiceState::Running) => ServiceDecision::DisableAndStop,
-        Some(ServiceState::Stopped) => ServiceDecision::DisableOnly,
-        Some(ServiceState::Pending) => ServiceDecision::Retry,
-    }
-}
-
-fn service_decision_blocks(decision: ServiceDecision) -> bool {
-    decision == ServiceDecision::DisableAndStop
-}
-
-fn alert_kind_for_process(name: &str) -> AlertKind {
-    match name {
-        "GenshinImpact.exe" | "UmamusumePrettyDerby.exe" | "Client-Win64-Shipping.exe" => {
-            AlertKind::StopSpending
-        }
-        "RobloxPlayerBeta.exe" | "RobloxPlayerLauncher.exe" | "RobloxStudioBeta.exe" => {
-            AlertKind::OriginalGames
-        }
-        _ => AlertKind::BetterGames,
-    }
-}
-
-fn alert_for_scan(terminated_targets: &[&str], service_blocked: bool) -> Option<AlertKind> {
-    let process_alert = terminated_targets
-        .iter()
-        .map(|name| alert_kind_for_process(name))
-        .min();
-    if service_blocked {
-        Some(AlertKind::BetterGames)
-    } else {
-        process_alert
-    }
-}
-
-fn configure_startup_task(install: bool) -> Result<(), String> {
-    let arguments = if install {
-        let executable = env::current_exe()
-            .map_err(|error| format!("could not determine executable path: {error}"))?;
-        startup_task_arguments(&executable)
-    } else {
-        uninstall_task_arguments()
-    };
-
-    let status = ProcessCommand::new("schtasks.exe")
-        .args(arguments)
-        .status()
-        .map_err(|error| format!("could not start schtasks.exe: {error}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("schtasks.exe exited with {status}"))
-    }
-}
-
-fn startup_task_arguments(executable: &Path) -> Vec<String> {
-    let task_command = format!(r#""{}" run"#, executable.display());
-    vec![
-        "/create".to_string(),
-        "/tn".to_string(),
-        TASK_NAME.to_string(),
-        "/tr".to_string(),
-        task_command,
-        "/sc".to_string(),
-        "onlogon".to_string(),
-        "/rl".to_string(),
-        "highest".to_string(),
-        "/f".to_string(),
-    ]
-}
-
-fn uninstall_task_arguments() -> Vec<String> {
-    vec![
-        "/delete".to_string(),
-        "/tn".to_string(),
-        TASK_NAME.to_string(),
-        "/f".to_string(),
-    ]
-}
-
-#[cfg(debug_assertions)]
-fn report_error(message: &str) {
-    eprintln!("rearguard: {message}");
-}
-
-#[cfg(not(debug_assertions))]
-fn report_error(_: &str) {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_default_and_explicit_run_modes() {
-        assert_eq!(parse_command(Vec::new()), Ok(CommandMode::Run));
-        assert_eq!(parse_command(vec!["run".to_string()]), Ok(CommandMode::Run));
-    }
-
-    #[test]
-    fn parses_setup_modes() {
-        assert_eq!(
-            parse_command(vec!["install".to_string()]),
-            Ok(CommandMode::Install)
-        );
-        assert_eq!(
-            parse_command(vec!["uninstall".to_string()]),
-            Ok(CommandMode::Uninstall)
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_or_extra_arguments() {
-        assert!(parse_command(vec!["status".to_string()]).is_err());
-        assert!(parse_command(vec!["run".to_string(), "now".to_string()]).is_err());
-    }
-
-    #[test]
-    fn decides_how_to_enforce_each_service_state() {
-        assert_eq!(service_decision(None), ServiceDecision::Missing);
-        assert_eq!(
-            service_decision(Some(ServiceState::Running)),
-            ServiceDecision::DisableAndStop
-        );
-        assert_eq!(
-            service_decision(Some(ServiceState::Stopped)),
-            ServiceDecision::DisableOnly
-        );
-        assert_eq!(
-            service_decision(Some(ServiceState::Pending)),
-            ServiceDecision::Retry
-        );
-    }
-
-    #[test]
-    fn only_successfully_stopping_a_running_service_triggers_an_alert() {
-        assert!(!service_decision_blocks(ServiceDecision::Missing));
-        assert!(!service_decision_blocks(ServiceDecision::DisableOnly));
-        assert!(service_decision_blocks(ServiceDecision::DisableAndStop));
-        assert!(!service_decision_blocks(ServiceDecision::Retry));
-    }
-
-    #[test]
-    fn a_scan_selects_one_alert_from_successful_blocks() {
-        assert_eq!(alert_for_scan(&[], false), None);
-        assert_eq!(alert_for_scan(&[], true), Some(AlertKind::BetterGames));
-        assert_eq!(
-            alert_for_scan(&["GenshinImpact.exe"], false),
-            Some(AlertKind::StopSpending)
-        );
-        assert_eq!(
-            alert_for_scan(&["RobloxPlayerBeta.exe"], false),
-            Some(AlertKind::OriginalGames)
-        );
-        assert_eq!(
-            alert_for_scan(&["RobloxPlayerBeta.exe", "GenshinImpact.exe"], false),
-            Some(AlertKind::StopSpending)
-        );
-        assert_eq!(
-            alert_for_scan(&["GenshinImpact.exe"], true),
-            Some(AlertKind::BetterGames)
-        );
-    }
-
-    #[test]
-    fn maps_every_target_to_its_dialog_message() {
-        for name in [
-            "VALORANT-Win64-Shipping.exe",
-            "vgc.exe",
-            "vgtray.exe",
-            "vgm.exe",
-            "LeagueClient.exe",
-        ] {
-            assert_eq!(alert_kind_for_process(name).message(), "Play better games.");
-        }
-        for name in [
-            "GenshinImpact.exe",
-            "UmamusumePrettyDerby.exe",
-            "Client-Win64-Shipping.exe",
-        ] {
-            assert_eq!(
-                alert_kind_for_process(name).message(),
-                "Stop burning away your money."
-            );
-        }
-        for name in [
-            "RobloxPlayerBeta.exe",
-            "RobloxPlayerLauncher.exe",
-            "RobloxStudioBeta.exe",
-        ] {
-            assert_eq!(
-                alert_kind_for_process(name).message(),
-                "Play original games."
-            );
-        }
-        assert_eq!(BLOCK_DIALOG_TITLE, "No.");
-    }
-
-    #[test]
-    fn includes_the_expected_process_targets() {
-        assert!(PROCESS_TARGETS.contains(&"VALORANT-Win64-Shipping.exe"));
-        assert!(PROCESS_TARGETS.contains(&"LeagueClient.exe"));
-        assert!(PROCESS_TARGETS.contains(&"GenshinImpact.exe"));
-    }
-
-    #[test]
-    fn builds_the_expected_scheduled_task_arguments() {
-        assert_eq!(
-            startup_task_arguments(Path::new(r"C:\Program Files\Rearguard\rearguard.exe")),
-            vec![
-                "/create",
-                "/tn",
-                "Windows Host Manager",
-                "/tr",
-                r#""C:\Program Files\Rearguard\rearguard.exe" run"#,
-                "/sc",
-                "onlogon",
-                "/rl",
-                "highest",
-                "/f",
-            ]
-        );
-        assert_eq!(
-            uninstall_task_arguments(),
-            vec!["/delete", "/tn", "Windows Host Manager", "/f"]
-        );
-    }
 }
