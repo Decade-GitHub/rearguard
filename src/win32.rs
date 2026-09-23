@@ -265,14 +265,14 @@ impl Service {
 }
 
 #[derive(Default)]
-pub(crate) struct ProcessEnforcementResult {
-    pub(crate) terminated_any: bool,
+pub(crate) struct ProcessEnforcementResult<'a> {
+    pub(crate) terminated_targets: Vec<&'a str>,
     pub(crate) first_error: Option<io::Error>,
 }
 
-impl ProcessEnforcementResult {
-    fn record_termination(&mut self) {
-        self.terminated_any = true;
+impl<'a> ProcessEnforcementResult<'a> {
+    fn record_termination(&mut self, target: &'a str) {
+        self.terminated_targets.push(target);
     }
 
     fn record_error(&mut self, error: io::Error) {
@@ -280,7 +280,9 @@ impl ProcessEnforcementResult {
     }
 }
 
-pub(crate) fn terminate_processes_by_exact_name(targets: &[&str]) -> ProcessEnforcementResult {
+pub(crate) fn terminate_processes_by_exact_name<'a>(
+    targets: &'a [&'a str],
+) -> ProcessEnforcementResult<'a> {
     let mut result = ProcessEnforcementResult::default();
     let snapshot = match KernelHandle::from_snapshot(unsafe {
         CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -302,12 +304,12 @@ pub(crate) fn terminate_processes_by_exact_name(targets: &[&str]) -> ProcessEnfo
     }
 
     loop {
-        if targets
+        if let Some(&target) = targets
             .iter()
-            .any(|target| executable_name_matches(&entry.executable_file, target))
+            .find(|target| executable_name_matches(&entry.executable_file, target))
         {
             match terminate_process(entry.process_id) {
-                Ok(()) => result.record_termination(),
+                Ok(()) => result.record_termination(target),
                 Err(error) => result.record_error(error),
             }
         }
@@ -397,16 +399,16 @@ mod tests {
     #[test]
     fn enumerates_processes_without_terminating_anything() {
         let result = terminate_processes_by_exact_name(&[]);
-        assert!(!result.terminated_any);
+        assert!(result.terminated_targets.is_empty());
         assert!(result.first_error.is_none());
     }
 
     #[test]
     fn tracks_successful_process_terminations_separately_from_errors() {
         let mut result = ProcessEnforcementResult::default();
-        result.record_termination();
+        result.record_termination("GenshinImpact.exe");
         result.record_error(io::Error::other("test error"));
-        assert!(result.terminated_any);
+        assert_eq!(result.terminated_targets, ["GenshinImpact.exe"]);
         assert!(result.first_error.is_some());
     }
 

@@ -30,8 +30,10 @@ const PROCESS_TARGETS: &[&str] = &[
 const SERVICE_TARGETS: &[&str] = &["vgc", "vgk"];
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const TASK_NAME: &str = "Windows Host Manager";
-const BLOCK_DIALOG_TITLE: &str = "VAN: STATUS_SB_POLICY";
-const BLOCK_DIALOG_MESSAGE: &str = "The secure boot policy of this device could not be verified. Please ensure the secure boot database is set to factory default settings.";
+const BLOCK_DIALOG_TITLE: &str = "No.";
+const BETTER_GAMES_MESSAGE: &str = "Play better games.";
+const STOP_SPENDING_MESSAGE: &str = "Stop spending money you don't have.";
+const ORIGINAL_GAMES_MESSAGE: &str = "Play origianal games.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandMode {
@@ -46,6 +48,23 @@ enum ServiceDecision {
     DisableOnly,
     DisableAndStop,
     Retry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AlertKind {
+    BetterGames,
+    StopSpending,
+    OriginalGames,
+}
+
+impl AlertKind {
+    fn message(self) -> &'static str {
+        match self {
+            Self::BetterGames => BETTER_GAMES_MESSAGE,
+            Self::StopSpending => STOP_SPENDING_MESSAGE,
+            Self::OriginalGames => ORIGINAL_GAMES_MESSAGE,
+        }
+    }
 }
 
 fn main() {
@@ -83,10 +102,8 @@ fn run_forever() -> ! {
     loop {
         let process_blocked = enforce_processes();
         let service_blocked = enforce_services();
-        if scan_was_blocked(process_blocked, service_blocked) {
-            if let Err(error) =
-                win32::show_error_message_box(BLOCK_DIALOG_MESSAGE, BLOCK_DIALOG_TITLE)
-            {
+        if let Some(alert) = alert_for_scan(&process_blocked, service_blocked) {
+            if let Err(error) = win32::show_error_message_box(alert.message(), BLOCK_DIALOG_TITLE) {
                 report_error(&format!("could not show blocking alert: {error}"));
             }
         }
@@ -94,12 +111,12 @@ fn run_forever() -> ! {
     }
 }
 
-fn enforce_processes() -> bool {
+fn enforce_processes() -> Vec<&'static str> {
     let result = win32::terminate_processes_by_exact_name(PROCESS_TARGETS);
     if let Some(error) = result.first_error {
         report_error(&format!("could not complete process enforcement: {error}"));
     }
-    result.terminated_any
+    result.terminated_targets
 }
 
 fn enforce_services() -> bool {
@@ -157,8 +174,28 @@ fn service_decision_blocks(decision: ServiceDecision) -> bool {
     decision == ServiceDecision::DisableAndStop
 }
 
-fn scan_was_blocked(process_blocked: bool, service_blocked: bool) -> bool {
-    process_blocked || service_blocked
+fn alert_kind_for_process(name: &str) -> AlertKind {
+    match name {
+        "GenshinImpact.exe" | "UmamusumePrettyDerby.exe" | "Client-Win64-Shipping.exe" => {
+            AlertKind::StopSpending
+        }
+        "RobloxPlayerBeta.exe" | "RobloxPlayerLauncher.exe" | "RobloxStudioBeta.exe" => {
+            AlertKind::OriginalGames
+        }
+        _ => AlertKind::BetterGames,
+    }
+}
+
+fn alert_for_scan(terminated_targets: &[&str], service_blocked: bool) -> Option<AlertKind> {
+    let process_alert = terminated_targets
+        .iter()
+        .map(|name| alert_kind_for_process(name))
+        .min();
+    if service_blocked {
+        Some(AlertKind::BetterGames)
+    } else {
+        process_alert
+    }
 }
 
 fn configure_startup_task(install: bool) -> Result<(), String> {
@@ -269,17 +306,59 @@ mod tests {
     }
 
     #[test]
-    fn a_scan_triggers_one_alert_if_processes_or_services_were_blocked() {
-        assert!(!scan_was_blocked(false, false));
-        assert!(scan_was_blocked(true, false));
-        assert!(scan_was_blocked(false, true));
-        assert!(scan_was_blocked(true, true));
+    fn a_scan_selects_one_alert_from_successful_blocks() {
+        assert_eq!(alert_for_scan(&[], false), None);
+        assert_eq!(alert_for_scan(&[], true), Some(AlertKind::BetterGames));
+        assert_eq!(
+            alert_for_scan(&["GenshinImpact.exe"], false),
+            Some(AlertKind::StopSpending)
+        );
+        assert_eq!(
+            alert_for_scan(&["RobloxPlayerBeta.exe"], false),
+            Some(AlertKind::OriginalGames)
+        );
+        assert_eq!(
+            alert_for_scan(&["RobloxPlayerBeta.exe", "GenshinImpact.exe"], false),
+            Some(AlertKind::StopSpending)
+        );
+        assert_eq!(
+            alert_for_scan(&["GenshinImpact.exe"], true),
+            Some(AlertKind::BetterGames)
+        );
     }
 
     #[test]
-    fn uses_the_expected_blocking_alert_copy() {
-        assert_eq!(BLOCK_DIALOG_TITLE, "Windows Error");
-        assert_eq!(BLOCK_DIALOG_MESSAGE, "No, bro. Play better games");
+    fn maps_every_target_to_its_dialog_message() {
+        for name in [
+            "VALORANT-Win64-Shipping.exe",
+            "vgc.exe",
+            "vgtray.exe",
+            "vgm.exe",
+            "LeagueClient.exe",
+        ] {
+            assert_eq!(alert_kind_for_process(name).message(), "Play better games.");
+        }
+        for name in [
+            "GenshinImpact.exe",
+            "UmamusumePrettyDerby.exe",
+            "Client-Win64-Shipping.exe",
+        ] {
+            assert_eq!(
+                alert_kind_for_process(name).message(),
+                "Stop burning away your money."
+            );
+        }
+        for name in [
+            "RobloxPlayerBeta.exe",
+            "RobloxPlayerLauncher.exe",
+            "RobloxStudioBeta.exe",
+        ] {
+            assert_eq!(
+                alert_kind_for_process(name).message(),
+                "Play original games."
+            );
+        }
+        assert_eq!(BLOCK_DIALOG_TITLE, "No.");
     }
 
     #[test]
