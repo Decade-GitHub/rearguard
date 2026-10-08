@@ -1,5 +1,3 @@
-//! Handwritten Win32 ABI surface used by the production executable.
-
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::{null, null_mut};

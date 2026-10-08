@@ -1,8 +1,7 @@
 # Rearguard
 
-Super minimalist Cargoless Rust app that stops you from playing bad games and kills Vanguard.
+Ultra minimalist Rust service app that stops you from playing bad games.
 
-The production executable uses Rust core and handwritten Win32 bindings. It links no Rust std/alloc library or MSVC C runtime, and uses a custom entry point. The optional test executable uses Rust's standard test harness; it is never linked into Rearguard.
 
 ## Dependencies
 
@@ -36,19 +35,19 @@ Artifacts go to build\debug, build\release, and build\test.
 
 ## Commands
 
-Run (argless as well):
+Run (argless default):
 
 ~~~powershell
 rearguard.exe run
 ~~~
 
-Permanently install the Windows Host Manager scheduled task:
+Permanently install the WHM task:
 
 ~~~powershell
 rearguard.exe install
 ~~~
 
-Remove that task:
+Remove task:
 
 ~~~powershell
 rearguard.exe uninstall

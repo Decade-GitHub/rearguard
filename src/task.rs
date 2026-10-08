@@ -22,8 +22,6 @@ struct Buffers {
 
 struct SharedBuffers(UnsafeCell<Buffers>);
 
-// Access is serialized by BUFFER_IN_USE. Rearguard's entry thread is normally
-// the sole caller, but the guard also makes this safe if that changes.
 unsafe impl Sync for SharedBuffers {}
 
 static BUFFERS: SharedBuffers = SharedBuffers(UnsafeCell::new(Buffers {

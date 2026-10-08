@@ -1,5 +1,3 @@
-//! Platform-independent decisions. This module uses only `core`.
-
 pub(crate) const PROCESS_TARGETS: &[&str] = &[
     "VALORANT-Win64-Shipping.exe",
     "vgc.exe",
@@ -100,9 +98,6 @@ pub(crate) fn alert_for_scan(process_alert: Option<AlertKind>, service_blocked: 
     }
 }
 
-// GetCommandLineW includes the executable name. Its first token follows the
-// special Windows argv[0] quoting rule; the only accepted later tokens are
-// ASCII command names, optionally surrounded by quotes.
 pub(crate) fn parse_command_line(command_line: &[u16]) -> Result<CommandMode, CommandError> {
     let mut index = 0;
     skip_space(command_line, &mut index);
